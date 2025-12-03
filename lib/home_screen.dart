@@ -1,7 +1,11 @@
 import 'dart:async';
+import 'dart:io'; // Import for File operations
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:geolocator/geolocator.dart';
+import 'package:path_provider/path_provider.dart'; // Import for directory paths
+import 'package:intl/intl.dart'; // Import for DateFormat
+import 'package:share_plus/share_plus.dart'; // Import for Sharing
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -67,6 +71,8 @@ class _HomeScreenState extends State<HomeScreen> {
     int diaAtual = DateTime.now().day;
     if (ultimoReset == null || ultimoReset != diaAtual) {
       await prefs.setInt('ultimoResetDia', diaAtual);
+      // Remove o flag de relatório gerado para o novo dia
+      await prefs.remove('relatorio_gerado_hoje'); 
       for (int i = 0; i < _horariosAulas.length; i++) {
         await prefs.remove('aula_${i}_check_realizado');
         await prefs.remove('aula_${i}_presente');
@@ -96,10 +102,6 @@ class _HomeScreenState extends State<HomeScreen> {
         timeLimit: const Duration(seconds: 10),
       );
       
-      debugPrint('--- LOCALIZAÇÃO DO USUÁRIO ---');
-      debugPrint('Latitude: ${position.latitude}, Longitude: ${position.longitude}');
-      debugPrint('---------------------------------');
-
       double distanceInMeters = Geolocator.distanceBetween(
         _latFaculdade!, 
         _lonFaculdade!, 
@@ -111,6 +113,70 @@ class _HomeScreenState extends State<HomeScreen> {
     } catch (e) {
       debugPrint('Erro ao pegar localização: $e');
       return false;
+    }
+  }
+
+  // --- Função COMPLETA para Gerar e Compartilhar CSV ---
+  Future<void> _gerarRelatorioCSV() async {
+    SharedPreferences prefs = await SharedPreferences.getInstance();
+    
+    // Verifica se já gerou hoje para não duplicar
+    bool jaGerou = prefs.getBool('relatorio_gerado_hoje') ?? false;
+    if (jaGerou) return;
+
+    try {
+      final directory = await getApplicationDocumentsDirectory();
+      final file = File('${directory.path}/attendance_report.csv');
+      
+      // Cabeçalho se o arquivo não existir
+      if (!await file.exists()) {
+        await file.writeAsString("Aluno,Dia,Rodada,Status\n");
+      }
+
+      String csvData = "";
+      String diaFormatado = DateFormat('yyyy-MM-dd').format(DateTime.now());
+
+      // Coleta dados das 4 aulas (Ciclo)
+      for (int i = 0; i < _horariosAulas.length; i++) {
+        String status = prefs.getString('aula_${i}_status_msg') ?? "Não verificado";
+        // Limpa formatação extra do status para o CSV (ex: remove parenteses)
+        status = status.replaceAll('(', '').replaceAll(')', '');
+        
+        // Formato: student/day/call up round/status
+        csvData += "$_nomeUsuario,$diaFormatado,${i + 1},$status\n";
+      }
+
+      // Append (adiciona ao final) no arquivo
+      await file.writeAsString(csvData, mode: FileMode.append);
+      
+      debugPrint("Relatório CSV salvo em: ${file.path}");
+      
+      // Marca como gerado
+      await prefs.setBool('relatorio_gerado_hoje', true);
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Ciclo completo! Preparando compartilhamento...')),
+        );
+
+        // --- LÓGICA DE COMPARTILHAMENTO ---
+        // Converte o arquivo para XFile (formato exigido pelo share_plus)
+        final xFile = XFile(file.path);
+        
+        // Abre o diálogo nativo de compartilhamento do Android/iOS
+        // O usuário pode escolher salvar no Drive, enviar por Email, WhatsApp, etc.
+        await Share.shareXFiles(
+          [xFile], 
+          text: 'Relatório de Presença - $_nomeUsuario - $diaFormatado'
+        );
+      }
+    } catch (e) {
+      debugPrint("Erro ao gerar/compartilhar CSV: $e");
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Erro: $e')),
+        );
+      }
     }
   }
 
@@ -157,17 +223,20 @@ class _HomeScreenState extends State<HomeScreen> {
           double limiteAtraso = inicioDouble + (minutosDeTolerancia / 60.0);
 
           if (!estaPresente) {
-
             presencaEncontrada = "(Ausente)";
           } else if (estaPresente && horaAtualDouble > limiteAtraso) {
-            // 2. Está no local, MAS atrasado (depois das 19:05, por ex.)
             presencaEncontrada = "(Presente - Atrasado)";
           } else {
-            // 3. Está no local E dentro da tolerância (antes das 19:05, por ex.)
             presencaEncontrada = "(Presença registrada)";
           }
           
-          await prefs.setString('aula_${i}_status_msg', presencaEncontrada); // Salva a msg
+          await prefs.setString('aula_${i}_status_msg', presencaEncontrada);
+          
+          // --- VERIFICAÇÃO DE CICLO COMPLETO ---
+          // Se estamos processando a última aula (índice 3), o ciclo do dia acabou.
+          if (i == 3) {
+             await _gerarRelatorioCSV();
+          }
         }
         break; 
       }
@@ -185,11 +254,12 @@ class _HomeScreenState extends State<HomeScreen> {
     await prefs.remove('user_longitude');
     await prefs.remove('user_name');
     
-    // Limpa os registros de presença da sessão
+    // Limpa os registros
+    await prefs.remove('relatorio_gerado_hoje');
     for (int i = 0; i < _horariosAulas.length; i++) {
       await prefs.remove('aula_${i}_check_realizado');
       await prefs.remove('aula_${i}_presente');
-      await prefs.remove('aula_${i}_status_msg'); // Limpa a msg de status
+      await prefs.remove('aula_${i}_status_msg');
     }
     await prefs.remove('ultimoResetDia');
 
@@ -200,7 +270,6 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  // --- BUILD ATUALIZADO para a cor Laranja ---
   @override
   Widget build(BuildContext context) {
     if (_isLoading) {
@@ -212,12 +281,11 @@ class _HomeScreenState extends State<HomeScreen> {
       );
     }
     
-    // Define a cor do status com base na presença
     Color corStatus = Colors.grey;
     if (_statusPresenca == "(Presença registrada)") {
       corStatus = Colors.green;
     } else if (_statusPresenca == "(Presente - Atrasado)") {
-      corStatus = Colors.orange; // <-- NOVA COR
+      corStatus = Colors.orange;
     } else if (_statusPresenca.contains("Ausente")) { 
       corStatus = Colors.red;
     }
@@ -270,7 +338,7 @@ class _HomeScreenState extends State<HomeScreen> {
                     style: TextStyle(
                       fontSize: 18,
                       fontWeight: FontWeight.w600,
-                      color: corStatus, // <-- Cor dinâmica
+                      color: corStatus,
                     ),
                   ),
                 ],
